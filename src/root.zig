@@ -186,25 +186,38 @@ pub const Proxy = struct {
                 error.HttpConnectionClosing => return,
                 else => return err,
             };
+            // Snapshot method + target *before* forwardRequest reads
+            // the body (which invalidates `request.head.target`). The
+            // 502 error path uses them to emit a structured log line.
+            const err_method = request.head.method;
+            var err_target_buf: [2048]u8 = undefined;
+            const target_len = @min(request.head.target.len, err_target_buf.len);
+            @memcpy(err_target_buf[0..target_len], request.head.target[0..target_len]);
+            const err_target = err_target_buf[0..target_len];
+            const err_started = std.time.milliTimestamp();
+
             self.forwardRequest(&request) catch |err| {
-                // Richer diagnostic than plain `logErr` — include the
-                // method and target so the user can correlate the 502
-                // to the exact request. Avoids "why did my client see
-                // a 502?" mysteries.
-                var buf: [512]u8 = undefined;
-                var w = std.fs.File.stderr().writerStreaming(&buf);
-                w.interface.print("forward error: {s} {s} -> {s}\n", .{
-                    @tagName(request.head.method),
-                    request.head.target,
-                    @errorName(err),
-                }) catch {};
-                w.interface.flush() catch {};
                 // Best-effort 502; close the connection after a fatal
                 // forward error — the transport state is suspect.
                 request.respond("bad gateway\n", .{
                     .status = .bad_gateway,
                     .keep_alive = false,
                 }) catch {};
+                // Uniform structured log line so `grep 502` in the
+                // stderr log finds failed requests just like any
+                // other status code, plus a short "why" continuation.
+                logRequest(.{
+                    .method = err_method,
+                    .target = err_target,
+                    .status = .bad_gateway,
+                    .elapsed_ms = std.time.milliTimestamp() - err_started,
+                    .req_bytes = 0,
+                    .resp_bytes = 12, // "bad gateway\n"
+                });
+                var buf: [256]u8 = undefined;
+                var w = std.fs.File.stderr().writerStreaming(&buf);
+                w.interface.print("  forward error: {s}\n", .{@errorName(err)}) catch {};
+                w.interface.flush() catch {};
                 return;
             };
         }
@@ -578,7 +591,29 @@ pub const Proxy = struct {
                 defer parsed.deinit();
                 root_ref_owned = self.gpa.dupe(u8, parsed.value.reference) catch null;
                 if (root_ref_owned) |ref| {
-                    chunk_info = self.inspectChunk(ref) catch null;
+                    // Fast path: for POST /bytes (single-chunk uploads)
+                    // and POST /chunks, we already have the bytes —
+                    // no need to side-fetch them back. Falls back to
+                    // the real side-fetch for multi-chunk uploads
+                    // (body > 4 KiB on /bytes) and for /bzz.
+                    const path = pathOnly(target_owned);
+                    if (std.mem.eql(u8, path, "/bytes")) {
+                        if (inspectPostBytesLocal(req_body_bytes)) |ci| {
+                            chunk_info = ci;
+                            self.rememberChunkInspection(ref, ci);
+                        } else {
+                            chunk_info = self.inspectChunk(ref) catch null;
+                        }
+                    } else if (std.mem.eql(u8, path, "/chunks")) {
+                        if (inspectPostChunksLocal(req_body_bytes)) |ci| {
+                            chunk_info = ci;
+                            self.rememberChunkInspection(ref, ci);
+                        } else {
+                            chunk_info = self.inspectChunk(ref) catch null;
+                        }
+                    } else {
+                        chunk_info = self.inspectChunk(ref) catch null;
+                    }
                     if (isBzzPath(target_owned)) {
                         manifest_info = self.inspectManifest(ref) catch null;
                     }
@@ -642,9 +677,23 @@ pub const Proxy = struct {
         out_headers: *std.ArrayList(http.Header),
         out_body: *Io.Writer.Allocating,
     ) !void {
+        // Ask upstream for identity only. std.http.Client's default
+        // advertises gzip + deflate; Bee then compresses some JSON
+        // responses (e.g. /addresses) and we'd forward the compressed
+        // bytes + `Content-Encoding: gzip` to clients that never asked
+        // for it. Identity-only keeps everything byte-exact.
+        //
+        // Note: `Request.accept_encoding` (the array) is the wrong
+        // knob here — the Client's emit loop explicitly *skips*
+        // identity, so an identity-only array produces a malformed
+        // empty `accept-encoding:` header and Bee 400s. The correct
+        // override is through `headers.accept_encoding = .override`.
         var upstream_req = try self.upstream_client.request(method, uri, .{
             .extra_headers = extra_headers,
             .keep_alive = true,
+            .headers = .{
+                .accept_encoding = .{ .override = "identity" },
+            },
         });
         defer upstream_req.deinit();
         errdefer if (upstream_req.connection) |c| {
@@ -780,6 +829,21 @@ pub const Proxy = struct {
         });
         if (result.status != .ok) return error.ChunkFetchFailed;
         return self.gpa.dupe(u8, body_writer.written());
+    }
+
+    /// Insert an externally-computed chunk Inspection into the memo.
+    /// Used by the local-inspect fast path on `POST /bytes` — we
+    /// already have the bytes, no need to fetch them back.
+    fn rememberChunkInspection(self: *Proxy, ref: []const u8, insp: chunks.Inspection) void {
+        self.inspection_mu.lock();
+        defer self.inspection_mu.unlock();
+        if (self.chunk_inspection_cache.count() >= INSPECTION_CACHE_MAX) {
+            self.clearInspectionCachesLocked();
+        }
+        const key_owned = self.gpa.dupe(u8, ref) catch return;
+        self.chunk_inspection_cache.put(self.gpa, key_owned, insp) catch {
+            self.gpa.free(key_owned);
+        };
     }
 
     /// Side-fetch the root chunk and inspect it as a Mantaray manifest
@@ -924,6 +988,28 @@ fn isHopByHop(name: []const u8) bool {
 fn pathOnly(target: []const u8) []const u8 {
     const end = std.mem.indexOfAnyPos(u8, target, 0, "?#") orelse target.len;
     return target[0..end];
+}
+
+/// Compute chunk Inspection locally for a `POST /bytes` request whose
+/// body fits in a single 4 KiB chunk. The request body IS the content
+/// Bee will store; the chunk wire format is just `span(LE u64) ||
+/// content`, so we synthesize it on the stack and inspect without any
+/// upstream round-trip. Returns null for oversized bodies — those
+/// become multi-chunk trees and need the real side-fetch to see the
+/// BMT-computed root.
+fn inspectPostBytesLocal(body: []const u8) ?chunks.Inspection {
+    if (body.len > 4096) return null;
+    var framed: [8 + 4096]u8 = undefined;
+    std.mem.writeInt(u64, framed[0..8], body.len, .little);
+    @memcpy(framed[8..][0..body.len], body);
+    return chunks.inspectChunkBytes(framed[0 .. 8 + body.len]) catch null;
+}
+
+/// Same idea for `POST /chunks`: the request body is already the full
+/// chunk wire format (span + content). Feed it directly to the
+/// inspector — zero extra traffic.
+fn inspectPostChunksLocal(body: []const u8) ?chunks.Inspection {
+    return chunks.inspectChunkBytes(body) catch null;
 }
 
 /// Returns true for errors that suggest a stale pooled TCP connection —
@@ -1811,47 +1897,26 @@ test "POST /bytes triggers root-chunk inspection: leaf tree" {
     defer proxy_listener.deinit();
     const proxy_port = proxy_listener.listen_address.getPort();
 
-    // Upstream serves 2 requests: the forwarded POST /bytes, then the
-    // chunk-inspection side-fetch GET /chunks/<ref>.
+    // Upstream serves 1 request — the forwarded POST /bytes. The
+    // proxy now inspects small bodies locally (body <= 4 KiB), so it
+    // does NOT side-fetch /chunks/<ref> for this test payload. A
+    // failing test here would hang on a never-arriving 2nd accept.
     const upstream_thread = try std.Thread.spawn(.{}, struct {
         fn serve(srv: *net.Server, ref: []const u8) !void {
-            // 1. POST /bytes → 201 with {"reference":...}
-            {
-                const conn = try srv.accept();
-                defer conn.stream.close();
-                var rb: [4096]u8 = undefined;
-                var wb: [4096]u8 = undefined;
-                var r = conn.stream.reader(&rb);
-                var w = conn.stream.writer(&wb);
-                var s = http.Server.init(r.interface(), &w.interface);
-                var req = try s.receiveHead();
-                var body_buf: [256]u8 = undefined;
-                const body = try std.fmt.bufPrint(&body_buf, "{{\"reference\":\"{s}\"}}", .{ref});
-                try req.respond(body, .{
-                    .status = .created,
-                    .keep_alive = false,
-                });
-            }
-            // 2. GET /chunks/<ref> → leaf chunk (span=100, 100 bytes content)
-            {
-                const conn = try srv.accept();
-                defer conn.stream.close();
-                var rb: [4096]u8 = undefined;
-                var wb: [4096]u8 = undefined;
-                var r = conn.stream.reader(&rb);
-                var w = conn.stream.writer(&wb);
-                var s = http.Server.init(r.interface(), &w.interface);
-                var req = try s.receiveHead();
-                try std.testing.expect(std.mem.startsWith(u8, req.head.target, "/chunks/"));
-
-                var chunk_bytes: [8 + 100]u8 = undefined;
-                std.mem.writeInt(u64, chunk_bytes[0..8], 100, .little);
-                @memset(chunk_bytes[8..], 'A');
-                try req.respond(&chunk_bytes, .{
-                    .status = .ok,
-                    .keep_alive = false,
-                });
-            }
+            const conn = try srv.accept();
+            defer conn.stream.close();
+            var rb: [4096]u8 = undefined;
+            var wb: [4096]u8 = undefined;
+            var r = conn.stream.reader(&rb);
+            var w = conn.stream.writer(&wb);
+            var s = http.Server.init(r.interface(), &w.interface);
+            var req = try s.receiveHead();
+            var body_buf: [256]u8 = undefined;
+            const body = try std.fmt.bufPrint(&body_buf, "{{\"reference\":\"{s}\"}}", .{ref});
+            try req.respond(body, .{
+                .status = .created,
+                .keep_alive = false,
+            });
         }
     }.serve, .{ &upstream, reference });
 
@@ -2061,10 +2126,14 @@ test "POST /bytes triggers root-chunk inspection: intermediate tree" {
     var body_writer: Io.Writer.Allocating = .fromArrayList(gpa, &body_buf);
     defer body_buf = body_writer.toArrayList();
 
+    // Body > 4 KiB so the local-inspect fast path declines and the
+    // proxy falls through to the real /chunks/<ref> side-fetch. This
+    // test exercises that side-fetch + the intermediate-tree decode.
+    const big_payload = [_]u8{'x'} ** 5000;
     _ = try client.fetch(.{
         .location = .{ .url = url },
         .method = .POST,
-        .payload = "x",
+        .payload = &big_payload,
         .response_writer = &body_writer.writer,
         .keep_alive = false,
     });
