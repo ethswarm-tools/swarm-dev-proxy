@@ -12,6 +12,7 @@ const usage =
     \\  --no-cache             disable GET /bytes and /chunks response cache
     \\  --no-chunks            skip root-chunk side-fetch on POST /bytes and /bzz
     \\  --no-post-dedup        disable content-hash dedup of POST /bytes and /chunks
+    \\  --max-body-mb N        reject requests whose content-length exceeds N MiB (413)
     \\  --mock                 serve from in-process mock (no upstream required)
     \\  --replay-log FILE      append every request/response to FILE as ndjson
     \\  --help, -h             show this message
@@ -49,6 +50,12 @@ pub fn main() !void {
             cfg.chunk_inspection_enabled = false;
         } else if (std.mem.eql(u8, a, "--no-post-dedup")) {
             cfg.post_dedup_enabled = false;
+        } else if (std.mem.eql(u8, a, "--max-body-mb")) {
+            i += 1;
+            if (i >= args.len) return die("--max-body-mb requires a number");
+            const mb = std.fmt.parseInt(u64, args[i], 10) catch
+                return die("invalid --max-body-mb value");
+            cfg.max_request_body_bytes = mb * 1024 * 1024;
         } else if (std.mem.eql(u8, a, "--mock")) {
             cfg.mock_enabled = true;
         } else if (std.mem.eql(u8, a, "--replay-log")) {

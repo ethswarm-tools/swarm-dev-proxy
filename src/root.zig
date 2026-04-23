@@ -37,6 +37,13 @@ pub const Config = struct {
     /// content under the same batch short-circuit to the cached
     /// response without touching the backend.
     post_dedup_enabled: bool = true,
+    /// Maximum request body size we'll accept from the client, in
+    /// bytes. `null` = unlimited. When set, requests whose
+    /// `content-length` exceeds this value are refused with 413
+    /// before we read the body. Chunked transfer encoding without
+    /// content-length is not capped (the check is a header
+    /// heuristic, not a streaming cap).
+    max_request_body_bytes: ?u64 = null,
 };
 
 pub const Proxy = struct {
@@ -53,6 +60,14 @@ pub const Proxy = struct {
     /// we give dapp clients. For a potjs bulk save (~8000 POST /bytes
     /// calls) this collapses ~8000 TCP handshakes to a handful.
     upstream_client: http.Client,
+    /// Memoized root-chunk Inspection per reference. On a dedup-heavy
+    /// workload (potjs re-uploads) the first POST fetches+inspects the
+    /// chunk; every subsequent POST that resolves to the same ref
+    /// reuses the cached Inspection instead of doing another upstream
+    /// side-fetch. Cap + clear-on-overflow mirrors the other caches.
+    inspection_mu: std.Thread.Mutex = .{},
+    chunk_inspection_cache: std.StringHashMapUnmanaged(chunks.Inspection) = .empty,
+    manifest_inspection_cache: std.StringHashMapUnmanaged(manifest.Inspection) = .empty,
     /// Optional replay log; owned by `main`/caller, set via
     /// `setReplayWriter` after `init`. A null pointer means "no log".
     replay_writer: ?*replay.Writer = null,
@@ -82,6 +97,28 @@ pub const Proxy = struct {
         self.mock_backend.deinit();
         self.post_dedup_cache.deinit();
         self.upstream_client.deinit();
+        self.clearInspectionCaches();
+        self.chunk_inspection_cache.deinit(self.gpa);
+        self.manifest_inspection_cache.deinit(self.gpa);
+    }
+
+    const INSPECTION_CACHE_MAX: usize = 100_000;
+
+    /// Caller must hold `inspection_mu`. Frees every cached key; values
+    /// are by-value (no owned pointers inside `Inspection`).
+    fn clearInspectionCachesLocked(self: *Proxy) void {
+        var cit = self.chunk_inspection_cache.iterator();
+        while (cit.next()) |e| self.gpa.free(e.key_ptr.*);
+        self.chunk_inspection_cache.clearRetainingCapacity();
+        var mit = self.manifest_inspection_cache.iterator();
+        while (mit.next()) |e| self.gpa.free(e.key_ptr.*);
+        self.manifest_inspection_cache.clearRetainingCapacity();
+    }
+
+    fn clearInspectionCaches(self: *Proxy) void {
+        self.inspection_mu.lock();
+        defer self.inspection_mu.unlock();
+        self.clearInspectionCachesLocked();
     }
 
     pub fn run(self: *Proxy) !void {
@@ -213,6 +250,28 @@ pub const Proxy = struct {
             }
             break :blk_range false;
         };
+
+        // Request-body size cap (early 413). Only examines
+        // content-length; chunked bodies bypass the check because
+        // their true length isn't known until the full body is read.
+        if (self.cfg.max_request_body_bytes) |cap| {
+            if (request.head.content_length) |cl| if (cl > cap) {
+                try request.respond("payload too large\n", .{
+                    .status = .payload_too_large,
+                    .keep_alive = false,
+                });
+                const elapsed_ms = std.time.milliTimestamp() - started;
+                logRequest(.{
+                    .method = method,
+                    .target = target_owned,
+                    .status = .payload_too_large,
+                    .elapsed_ms = elapsed_ms,
+                    .req_bytes = cl,
+                    .resp_bytes = 18,
+                });
+                return;
+            };
+        }
 
         // Cache lookup (immutable content-addressed GETs only).
         const cache_key: ?[]const u8 = blk: {
@@ -660,10 +719,33 @@ pub const Proxy = struct {
     /// Fetch the chunk bytes at `ref` from whichever backend is active
     /// (mock or upstream) and decode the root chunk. Returns error on
     /// fetch failure; logRequest tolerates null gracefully.
+    ///
+    /// Memoized by reference: the first call for a given ref does the
+    /// side-fetch; subsequent calls for the same ref return the cached
+    /// Inspection. This matters on POT workloads where the same content
+    /// is re-uploaded many times (dedup hits) — without the memo,
+    /// chunk inspection would double upstream traffic on every repeat.
     fn inspectChunk(self: *Proxy, ref: []const u8) !chunks.Inspection {
+        {
+            self.inspection_mu.lock();
+            defer self.inspection_mu.unlock();
+            if (self.chunk_inspection_cache.get(ref)) |cached| return cached;
+        }
+
         const raw = try self.fetchChunkBytes(ref);
         defer self.gpa.free(raw);
-        return chunks.inspectChunkBytes(raw);
+        const insp = try chunks.inspectChunkBytes(raw);
+
+        self.inspection_mu.lock();
+        defer self.inspection_mu.unlock();
+        if (self.chunk_inspection_cache.count() >= INSPECTION_CACHE_MAX) {
+            self.clearInspectionCachesLocked();
+        }
+        const key_owned = self.gpa.dupe(u8, ref) catch return insp;
+        self.chunk_inspection_cache.put(self.gpa, key_owned, insp) catch {
+            self.gpa.free(key_owned);
+        };
+        return insp;
     }
 
     /// Side-fetch `GET /chunks/{ref}` through whichever backend is
@@ -701,12 +783,28 @@ pub const Proxy = struct {
     }
 
     /// Side-fetch the root chunk and inspect it as a Mantaray manifest
-    /// node. Cheap (one extra round-trip per bzz upload). Silent
-    /// failure on anything that isn't a well-formed Mantaray node.
+    /// node. Same memoization as `inspectChunk`.
     fn inspectManifest(self: *Proxy, ref: []const u8) !manifest.Inspection {
+        {
+            self.inspection_mu.lock();
+            defer self.inspection_mu.unlock();
+            if (self.manifest_inspection_cache.get(ref)) |cached| return cached;
+        }
+
         const raw = try self.fetchChunkBytes(ref);
         defer self.gpa.free(raw);
-        return manifest.inspectChunkBytes(raw);
+        const insp = manifest.inspectChunkBytes(raw);
+
+        self.inspection_mu.lock();
+        defer self.inspection_mu.unlock();
+        if (self.manifest_inspection_cache.count() >= INSPECTION_CACHE_MAX) {
+            self.clearInspectionCachesLocked();
+        }
+        const key_owned = self.gpa.dupe(u8, ref) catch return insp;
+        self.manifest_inspection_cache.put(self.gpa, key_owned, insp) catch {
+            self.gpa.free(key_owned);
+        };
+        return insp;
     }
 
     fn isUploadPath(target: []const u8) bool {
