@@ -106,10 +106,29 @@ pub const Proxy = struct {
                 logErr("accept", err);
                 continue;
             };
-            self.handleConnection(conn) catch |err| {
-                logErr("connection", err);
+            // Detached thread per connection — real concurrency so
+            // clients with parallel workers (bee-js's manifestUploader
+            // fires 32-concurrent) don't serialize at the accept loop.
+            // Everything the thread touches is protected:
+            //   * shared http.Client -> thread-safe ConnectionPool
+            //   * all trackers + caches -> their own mutexes
+            //   * enc/act counters -> atomics
+            //   * request-scoped state (req_body, resp_headers, ...)
+            //     is stack-local to each thread.
+            const t = std.Thread.spawn(.{}, connectionEntry, .{ self, conn }) catch |err| {
+                logErr("spawn", err);
+                conn.stream.close();
+                continue;
             };
+            t.detach();
         }
+    }
+
+    /// Entry for detached per-connection worker threads.
+    fn connectionEntry(self: *Proxy, conn: net.Server.Connection) void {
+        self.handleConnection(conn) catch |err| {
+            logErr("connection", err);
+        };
     }
 
     /// Accepts a single connection (already established), serves it, returns.
@@ -358,10 +377,12 @@ pub const Proxy = struct {
                     &resp_headers,
                     &resp_body,
                 ) catch |err| {
+                    // Transport-class errors mean the specific pooled
+                    // connection was stale; sendUpstreamOnce has already
+                    // marked it `closing` via errdefer. Retry once and
+                    // the pool will hand us a fresh connection instead.
                     if (attempt < 1 and isUpstreamTransportError(err)) {
                         logPoolReset(err);
-                        self.upstream_client.deinit();
-                        self.upstream_client = .{ .allocator = self.gpa };
                         continue;
                     }
                     return err;
@@ -544,8 +565,14 @@ pub const Proxy = struct {
     /// One attempt at the upstream round-trip: open request, write body,
     /// read response headers + body. Output parameters are populated on
     /// success; on error, whatever partial state got written is the
-    /// caller's problem to reset. Extracted so the retry loop in
-    /// `forwardRequest` can invoke it twice.
+    /// caller's problem to reset.
+    ///
+    /// Thread-safety: on any error we mark this specific connection
+    /// `.closing = true` before `deinit` releases it back to the pool.
+    /// That tells the pool to drop this connection rather than hand it
+    /// out to the next caller. Per-connection safety replaces the
+    /// earlier global `deinit(client) + reinit` approach, which was
+    /// racy once the accept loop became multi-threaded.
     fn sendUpstreamOnce(
         self: *Proxy,
         method: http.Method,
@@ -561,13 +588,17 @@ pub const Proxy = struct {
             .keep_alive = true,
         });
         defer upstream_req.deinit();
+        errdefer if (upstream_req.connection) |c| {
+            c.closing = true;
+        };
 
         if (method.requestHasBody()) {
             upstream_req.transfer_encoding = .{ .content_length = req_body_bytes.len };
             var body_writer = try upstream_req.sendBodyUnflushed(&.{});
             try body_writer.writer.writeAll(req_body_bytes);
             try body_writer.end();
-            try upstream_req.connection.?.flush();
+            const conn = upstream_req.connection orelse return error.UpstreamConnectionGone;
+            try conn.flush();
         } else {
             try upstream_req.sendBodiless();
         }
@@ -826,7 +857,7 @@ fn logPoolReset(err: anyerror) void {
     var buf: [256]u8 = undefined;
     var w = std.fs.File.stderr().writerStreaming(&buf);
     w.interface.print(
-        "upstream pool reset after {s}; retrying with fresh dial\n",
+        "stale upstream conn after {s}; dropped + retrying with fresh dial\n",
         .{@errorName(err)},
     ) catch return;
     w.interface.flush() catch return;

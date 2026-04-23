@@ -112,8 +112,15 @@ P0 shipped. Working today:
   live: 20 proxy→Bee requests produce exactly one TCP connection.
 - Pool recovery — stale pooled connections (Bee closed idle conn,
   network hiccup) no longer wedge the proxy. On any transport-class
-  error the whole pool is reset and the request retries once with a
-  fresh dial; real 4xx/5xx from Bee pass through untouched.
+  error the specific bad connection is marked closing and the request
+  retries once with a fresh dial; real 4xx/5xx from Bee pass through
+  untouched.
+- Threaded accept loop — one detached thread per connection, so
+  concurrent clients don't serialize at the proxy. Measured live: 64
+  parallel requests collapsed from 3.66 s to 0.21 s, ~17× wall-clock
+  win.
+- Bounded caches — both GET-cache and POST-dedup enforce a 100 000
+  entry cap with clear-on-overflow. Eviction counter exposed in stats.
 
 Example output:
 ```

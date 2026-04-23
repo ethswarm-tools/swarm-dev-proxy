@@ -14,6 +14,13 @@ pub const Entry = struct {
     body: []const u8,
 };
 
+/// Upper bound on entries before we dump the whole cache. Simple
+/// "clear-on-overflow" keeps the data structure tiny while still
+/// providing an effective bound on RSS during long-running workloads.
+/// Not LRU, but good enough for hot-path dedup; lost entries just
+/// cost a cache miss (backend call) next time.
+pub const MAX_ENTRIES_DEFAULT: usize = 100_000;
+
 pub const Cache = struct {
     gpa: std.mem.Allocator,
     mu: std.Thread.Mutex = .{},
@@ -21,6 +28,8 @@ pub const Cache = struct {
     total_bytes: u64 = 0,
     hits: u64 = 0,
     misses: u64 = 0,
+    evictions: u64 = 0,
+    max_entries: usize = MAX_ENTRIES_DEFAULT,
 
     const Stored = struct {
         status: u16,
@@ -71,6 +80,11 @@ pub const Cache = struct {
         defer c.mu.unlock();
         if (c.entries.contains(key)) return;
 
+        if (c.entries.count() >= c.max_entries) {
+            c.clearLocked();
+            c.evictions += 1;
+        }
+
         const key_owned = try c.gpa.dupe(u8, key);
         errdefer c.gpa.free(key_owned);
         const body_owned = try c.gpa.dupe(u8, body);
@@ -86,11 +100,26 @@ pub const Cache = struct {
         c.total_bytes += body.len;
     }
 
+    /// Caller must hold c.mu. Free every stored entry + key and reset
+    /// counters associated with live storage (`total_bytes`). `hits`,
+    /// `misses`, and `evictions` are lifetime totals and persist.
+    fn clearLocked(c: *Cache) void {
+        var it = c.entries.iterator();
+        while (it.next()) |e| {
+            c.gpa.free(e.key_ptr.*);
+            if (e.value_ptr.content_type) |ct| c.gpa.free(ct);
+            c.gpa.free(e.value_ptr.body);
+        }
+        c.entries.clearRetainingCapacity();
+        c.total_bytes = 0;
+    }
+
     pub const Stats = struct {
         entries: usize,
         bytes: u64,
         hits: u64,
         misses: u64,
+        evictions: u64 = 0,
     };
 
     pub fn stats(c: *Cache) Stats {
@@ -101,6 +130,7 @@ pub const Cache = struct {
             .bytes = c.total_bytes,
             .hits = c.hits,
             .misses = c.misses,
+            .evictions = c.evictions,
         };
     }
 };

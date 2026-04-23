@@ -172,6 +172,37 @@ hackathon window.
     20 requests through the proxy produce exactly **one** upstream
     TCP connection.
 
+22. **Threaded accept loop.** ✅ shipped. `run()` now spawns a
+    detached `std.Thread` per accepted connection, so concurrent
+    clients (bee-js's manifestUploader fires 32-concurrent) no
+    longer serialize at the proxy. Every tracker/cache in the
+    Proxy struct was already mutex-guarded or atomic; the shared
+    `http.Client.ConnectionPool` is thread-safe by design.
+    Measured live: 64 parallel `curl`s collapsed from 3.66 s
+    (sequential) to 0.21 s (threaded) — ~17× wall-clock win.
+
+23. **Pool recovery went per-connection.** The global
+    `client.deinit() + reinit` from #21 wasn't safe once the accept
+    loop became threaded — another thread could be mid-request
+    through the same client. Now on any error, `sendUpstreamOnce`
+    uses `errdefer` to mark **this specific connection** `.closing
+    = true`, so `deinit` drops it instead of returning it to the
+    pool. Retry then dials fresh per-thread. Same observable
+    behaviour as #21, no cross-thread races.
+
+24. **Bounded caches.** Both `cache.Cache` (GET) and
+    `post_dedup.Cache` (POST) now enforce a 100 000-entry cap with
+    a simple clear-on-overflow policy. Not LRU — on overflow the
+    whole map is dumped and the next inserts rebuild it. Keeps RSS
+    bounded during multi-hour runs; the eviction count is tracked
+    and surfaced in `Stats`. Lifetime counters (`hits`, `misses`,
+    `bytes_saved`) persist across evictions.
+
+25. **`upstream_req.connection.?.flush()` null-guard.** The `.?`
+    unwrap was a latent panic if the client cleared the connection
+    early. Now an `orelse return error.UpstreamConnectionGone` so
+    the retry loop sees a real error instead of a crash.
+
 21. **Upstream retry-with-pool-reset on transport errors.** ✅ shipped.
     Under a sustained workload (fullcircle-research's 47k-chunk
     manifest save), the remote Bee occasionally closes a pooled

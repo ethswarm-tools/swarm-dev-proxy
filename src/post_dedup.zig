@@ -38,7 +38,12 @@ pub const Stats = struct {
     hits: u64,
     misses: u64,
     bytes_saved: u64,
+    evictions: u64 = 0,
 };
+
+/// Upper bound on entries before we dump the whole cache. Same rationale
+/// as `cache.MAX_ENTRIES_DEFAULT`.
+pub const MAX_ENTRIES_DEFAULT: usize = 100_000;
 
 pub const Cache = struct {
     gpa: std.mem.Allocator,
@@ -46,6 +51,8 @@ pub const Cache = struct {
     entries: std.StringHashMapUnmanaged(Stored) = .empty,
     hits: u64 = 0,
     misses: u64 = 0,
+    evictions: u64 = 0,
+    max_entries: usize = MAX_ENTRIES_DEFAULT,
     /// Cumulative request-body bytes the proxy avoided sending upstream
     /// because of dedup hits.
     bytes_saved: u64 = 0,
@@ -126,6 +133,10 @@ pub const Cache = struct {
             c.gpa.free(key);
             return;
         }
+        if (c.entries.count() >= c.max_entries) {
+            c.clearLocked();
+            c.evictions += 1;
+        }
         const body_owned = try c.gpa.dupe(u8, entry.body);
         errdefer c.gpa.free(body_owned);
         const ct_owned: ?[]const u8 = if (entry.content_type) |ct| try c.gpa.dupe(u8, ct) else null;
@@ -138,6 +149,17 @@ pub const Cache = struct {
         });
     }
 
+    /// Caller must hold c.mu. Frees all live entries; counters persist.
+    fn clearLocked(c: *Cache) void {
+        var it = c.entries.iterator();
+        while (it.next()) |e| {
+            c.gpa.free(e.key_ptr.*);
+            if (e.value_ptr.content_type) |ct| c.gpa.free(ct);
+            c.gpa.free(e.value_ptr.body);
+        }
+        c.entries.clearRetainingCapacity();
+    }
+
     pub fn stats(c: *Cache) Stats {
         c.mu.lock();
         defer c.mu.unlock();
@@ -146,6 +168,7 @@ pub const Cache = struct {
             .hits = c.hits,
             .misses = c.misses,
             .bytes_saved = c.bytes_saved,
+            .evictions = c.evictions,
         };
     }
 };
