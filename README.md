@@ -107,6 +107,9 @@ P0 shipped. Working today:
   are all content-addressed under their manifest root; full paths are
   cached forever. `Range`-header probes bypass (used for existence
   checks on the explorer lookup page).
+- Upstream connection pool — one long-lived `std.http.Client` keeps TCP
+  connections to Bee alive across all forwarded requests. Measured
+  live: 20 proxy→Bee requests produce exactly one TCP connection.
 
 Example output:
 ```

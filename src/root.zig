@@ -47,6 +47,12 @@ pub const Proxy = struct {
     download_cache: cache.Cache,
     mock_backend: mock.Backend,
     post_dedup_cache: post_dedup.Cache,
+    /// Long-lived HTTP client for every upstream call. Its internal
+    /// `ConnectionPool` keeps TCP connections to Bee alive across
+    /// requests, which is the upstream mirror of the HTTP keep-alive
+    /// we give dapp clients. For a potjs bulk save (~8000 POST /bytes
+    /// calls) this collapses ~8000 TCP handshakes to a handful.
+    upstream_client: http.Client,
     /// Optional replay log; owned by `main`/caller, set via
     /// `setReplayWriter` after `init`. A null pointer means "no log".
     replay_writer: ?*replay.Writer = null,
@@ -65,6 +71,7 @@ pub const Proxy = struct {
             .download_cache = .{ .gpa = gpa },
             .mock_backend = .{ .gpa = gpa },
             .post_dedup_cache = .{ .gpa = gpa },
+            .upstream_client = .{ .allocator = gpa },
         };
     }
 
@@ -74,6 +81,7 @@ pub const Proxy = struct {
         self.download_cache.deinit();
         self.mock_backend.deinit();
         self.post_dedup_cache.deinit();
+        self.upstream_client.deinit();
     }
 
     pub fn run(self: *Proxy) !void {
@@ -123,7 +131,18 @@ pub const Proxy = struct {
                 else => return err,
             };
             self.forwardRequest(&request) catch |err| {
-                logErr("forward", err);
+                // Richer diagnostic than plain `logErr` — include the
+                // method and target so the user can correlate the 502
+                // to the exact request. Avoids "why did my client see
+                // a 502?" mysteries.
+                var buf: [512]u8 = undefined;
+                var w = std.fs.File.stderr().writerStreaming(&buf);
+                w.interface.print("forward error: {s} {s} -> {s}\n", .{
+                    @tagName(request.head.method),
+                    request.head.target,
+                    @errorName(err),
+                }) catch {};
+                w.interface.flush() catch {};
                 // Best-effort 502; close the connection after a fatal
                 // forward error — the transport state is suspect.
                 request.respond("bad gateway\n", .{
@@ -296,10 +315,10 @@ pub const Proxy = struct {
             if (mr.feed_next_hex) |nxt| try appendHeader(self.gpa, &resp_headers, "swarm-feed-index-next", nxt);
             try resp_body.writer.writeAll(mr.body);
         } else {
-            // Forward to upstream Bee node.
-            var client: http.Client = .{ .allocator = self.gpa };
-            defer client.deinit();
-
+            // Forward to upstream Bee node via the shared, pooled
+            // client. `keep_alive = true` lets the client's internal
+            // ConnectionPool reuse the TCP connection for the next
+            // upstream call.
             const url = try std.fmt.allocPrint(self.gpa, "http://{s}:{d}{s}", .{
                 self.cfg.upstream_host, self.cfg.upstream_port, target_owned,
             });
@@ -307,9 +326,9 @@ pub const Proxy = struct {
 
             const uri = try std.Uri.parse(url);
 
-            var upstream_req = try client.request(method, uri, .{
+            var upstream_req = try self.upstream_client.request(method, uri, .{
                 .extra_headers = fwd_headers.items,
-                .keep_alive = false,
+                .keep_alive = true,
             });
             defer upstream_req.deinit();
 
@@ -576,19 +595,16 @@ pub const Proxy = struct {
         });
         defer self.gpa.free(url);
 
-        var client: http.Client = .{ .allocator = self.gpa };
-        defer client.deinit();
-
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(self.gpa);
         var body_writer: Io.Writer.Allocating = .fromArrayList(self.gpa, &body);
         defer body = body_writer.toArrayList();
 
-        const result = try client.fetch(.{
+        const result = try self.upstream_client.fetch(.{
             .location = .{ .url = url },
             .method = .GET,
             .response_writer = &body_writer.writer,
-            .keep_alive = false,
+            .keep_alive = true,
         });
         if (result.status != .ok) return error.ChunkFetchFailed;
         return self.gpa.dupe(u8, body_writer.written());
@@ -635,6 +651,7 @@ pub const Proxy = struct {
         }
         const parsed = try fetchStampCapacity(
             self.gpa,
+            &self.upstream_client,
             self.cfg.upstream_host,
             self.cfg.upstream_port,
             batch_id,
@@ -666,6 +683,7 @@ pub fn parseStampJson(gpa: std.mem.Allocator, body: []const u8) !std.json.Parsed
 
 fn fetchStampCapacity(
     gpa: std.mem.Allocator,
+    client: *http.Client,
     upstream_host: []const u8,
     upstream_port: u16,
     batch_id: []const u8,
@@ -674,9 +692,6 @@ fn fetchStampCapacity(
         upstream_host, upstream_port, batch_id,
     });
     defer gpa.free(url);
-
-    var client: http.Client = .{ .allocator = gpa };
-    defer client.deinit();
 
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(gpa);
@@ -687,7 +702,7 @@ fn fetchStampCapacity(
         .location = .{ .url = url },
         .method = .GET,
         .response_writer = &body_writer.writer,
-        .keep_alive = false,
+        .keep_alive = true,
     });
     if (result.status != .ok) return error.StampNotFound;
 

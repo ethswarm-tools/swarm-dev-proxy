@@ -363,6 +363,42 @@ first fetch.
 
 ---
 
+## 2c. Upstream connection pool — measure it yourself
+
+The proxy keeps a single long-lived TCP connection to Bee and reuses
+it across every forwarded request. Trivial to verify with `ss`:
+
+```bash
+# Terminal 1 — proxy pointed at your Bee
+./zig-out/bin/swarm_dev_proxy --listen 127.0.0.1:1733
+
+# Terminal 2
+echo "before any request:"
+ss -t state established dst :1633 | wc -l
+
+for i in $(seq 1 20); do
+  curl -s -o /dev/null --compressed http://127.0.0.1:1733/health
+done
+
+echo "after 20 proxy→Bee requests:"
+ss -t state established dst :1633 | wc -l
+```
+
+Expected output on my box:
+
+```
+before any request:
+1                              ← your normal environment (curl itself, ssh, etc)
+after 20 proxy→Bee requests:
+2                              ← one extra: the proxy's single pooled upstream conn
+```
+
+Without pooling the second number would be 21 (or oscillate wildly as
+connections landed in TIME_WAIT). For a potjs bulk save of ~8000 puts,
+that's ~8000 TCP+HTTP handshakes avoided on the Bee side.
+
+---
+
 ## 3. Before/after benchmark
 
 To quantify the speedup, run the same workload with features disabled,
@@ -430,6 +466,56 @@ Against **real** Bee the difference is much larger because each
 write. For a potjs workload that re-runs (e.g. a dev iteration loop,
 or the three-KVS pattern in fullcircle-research), a 10–50× speedup on
 the repeat iterations is typical.
+
+---
+
+## 3b. Unblocking fullcircle-research upload
+
+If `pnpm era:upload --bee-url http://127.0.0.1:1733 …` hits
+`404 batch with id not found` the problem is **Bee-side**, not the
+proxy. Check:
+
+```bash
+# Does the batch exist?
+curl -s --compressed http://localhost:1633/stamps/<your-batch-id>
+# -> {"code":404,"message":"issuer does not exist"}   — Bee doesn't have it
+
+# Do you have any batches at all?
+curl -s --compressed http://localhost:1633/stamps | jq '.stamps[]'
+
+# Can you mint one?
+curl -s --compressed http://localhost:1633/chequebook/balance
+# availableBalance must be > 0 to buy a stamp.
+swarm-cli stamp buy --yes --verbose --depth 20 --amount 1b
+```
+
+If the earlier terminal output showed `502 bad gateway` with
+`responseBody: 'bad gateway\n'`, that's **our** proxy's forward-error
+path. In the current build you'll also see a matching line on the
+proxy stderr like:
+
+```
+forward error: POST /bytes -> ConnectionRefused
+```
+
+…which points directly at whatever connection, DNS, or upstream
+problem caused it. (If you were running an older binary the stderr
+line would just say `forward error: ConnectionRefused` without the
+method+target context — rebuild with `zig build` to get the richer
+diagnostic.)
+
+**Known root cause for 502 with a URL-style `--upstream`.** The
+parser used to split on the last `:` and kept `http://` as part of
+the hostname, so `--upstream http://HOST:PORT` expanded into requests
+against hostname `"http"`. Fixed in the current build — verify with:
+
+```bash
+./zig-out/bin/swarm_dev_proxy --listen 127.0.0.1:1733 --upstream http://65.109.80.9:3000
+# banner: "swarm-dev-proxy listening on http://127.0.0.1:1733 -> http://65.109.80.9:3000"
+```
+
+Banner shows no double `http://http://`. If it does, `zig build` to
+rebuild.
 
 ---
 

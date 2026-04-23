@@ -74,11 +74,25 @@ pub fn main() !void {
     try p.run();
 }
 
+/// Accepts `HOST:PORT`, or with a URL-style `http://` prefix. `https://`
+/// is rejected explicitly because we don't do TLS to upstream yet.
+/// Any trailing path (`/`, `/bytes`, `…?foo`) is stripped.
 fn parseHostPort(spec: []const u8, host: *[]const u8, port: *u16) !void {
-    const colon = std.mem.lastIndexOfScalar(u8, spec, ':') orelse
+    var s: []const u8 = spec;
+    if (std.mem.startsWith(u8, s, "https://")) {
+        return die("https:// upstream not supported — use http://HOST:PORT");
+    }
+    if (std.mem.startsWith(u8, s, "http://")) {
+        s = s["http://".len..];
+    }
+    // Drop any trailing path / query / fragment after the authority.
+    if (std.mem.indexOfAnyPos(u8, s, 0, "/?#")) |end| {
+        s = s[0..end];
+    }
+    const colon = std.mem.lastIndexOfScalar(u8, s, ':') orelse
         return die("expected HOST:PORT");
-    host.* = spec[0..colon];
-    port.* = std.fmt.parseInt(u16, spec[colon + 1 ..], 10) catch
+    host.* = s[0..colon];
+    port.* = std.fmt.parseInt(u16, s[colon + 1 ..], 10) catch
         return die("invalid port");
 }
 
@@ -103,4 +117,20 @@ test "parseHostPort splits 127.0.0.1:1633" {
     try parseHostPort("127.0.0.1:1633", &host, &port);
     try std.testing.expectEqualStrings("127.0.0.1", host);
     try std.testing.expectEqual(@as(u16, 1633), port);
+}
+
+test "parseHostPort accepts http:// prefix and a trailing path" {
+    var host: []const u8 = "";
+    var port: u16 = 0;
+    try parseHostPort("http://65.109.80.9:3000", &host, &port);
+    try std.testing.expectEqualStrings("65.109.80.9", host);
+    try std.testing.expectEqual(@as(u16, 3000), port);
+
+    try parseHostPort("http://bee.example.org:1633/", &host, &port);
+    try std.testing.expectEqualStrings("bee.example.org", host);
+    try std.testing.expectEqual(@as(u16, 1633), port);
+
+    try parseHostPort("http://host:8080/some/path?q=1", &host, &port);
+    try std.testing.expectEqualStrings("host", host);
+    try std.testing.expectEqual(@as(u16, 8080), port);
 }

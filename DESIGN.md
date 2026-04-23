@@ -162,6 +162,34 @@ hackathon window.
     potjs: upload then lazy-read child nodes is the dominant pattern
     during re-runs of the same pipeline.
 
+18. **Upstream connection pooling.** ✅ shipped. `Proxy` now owns a
+    long-lived `std.http.Client`; every upstream call (the forward
+    path plus side-fetches for chunk inspection, manifest inspection,
+    stamp capacity) uses it with `.keep_alive = true`. Its internal
+    `ConnectionPool` reuses the TCP connection to Bee across
+    requests. For a potjs bulk save (~8000 POSTs) this collapses
+    ~8000 TCP handshakes to one. Verified on a real Bee with `ss`:
+    20 requests through the proxy produce exactly **one** upstream
+    TCP connection.
+
+20. **CLI accepts `http://HOST:PORT` for `--upstream`.** Previously
+    `parseHostPort` split on the last `:` and treated `http://65…:3000`
+    as host `"http://65…"`, port `3000`. Every upstream call then
+    tried to connect to hostname `"http"` and bounced with
+    `InvalidPort` / `ConnectionRefused` → the client saw 502. The
+    parser now strips `http://` (rejects `https://` explicitly
+    because we don't do TLS upstream yet) and drops any trailing
+    path/query. Verified live by running fullcircle-research's
+    `era:upload` against a remote Bee at `http://65.109.80.9:3000` —
+    300+ POST /bytes round-trips, all clean.
+
+19. **Richer 502 diagnostic.** Minor but consequential: when
+    `forwardRequest` errors, the proxy now prints
+    `forward error: POST /bytes -> ConnectionRefused` (method +
+    target + error name) instead of just `forward error: <name>`.
+    Makes "why did my client see 502?" trivially diagnosable from
+    the stderr log.
+
 16. **Client keep-alive.** ✅ shipped. All four `request.respond`
     sites now pass `.keep_alive = request.head.keep_alive` so a
     HTTP/1.1 client's connection is kept open by default. The
