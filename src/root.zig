@@ -319,6 +319,16 @@ pub const Proxy = struct {
             // client. `keep_alive = true` lets the client's internal
             // ConnectionPool reuse the TCP connection for the next
             // upstream call.
+            //
+            // Retry discipline: pooled connections can go stale (Bee
+            // closes an idle TCP conn, server-side GC, etc.). A stale
+            // pooled connection then fails the next request instantly
+            // with BrokenPipe/ConnectionResetByPeer/ReadFailed — if we
+            // bail on that, one bad socket wedges every subsequent
+            // request. Fix: on any transport-class error, drop the
+            // whole pool (deinit+reinit), then retry once with a fresh
+            // dial. Real 4xx/5xx responses from Bee are not treated as
+            // transport errors and always pass through.
             const url = try std.fmt.allocPrint(self.gpa, "http://{s}:{d}{s}", .{
                 self.cfg.upstream_host, self.cfg.upstream_port, target_owned,
             });
@@ -326,43 +336,37 @@ pub const Proxy = struct {
 
             const uri = try std.Uri.parse(url);
 
-            var upstream_req = try self.upstream_client.request(method, uri, .{
-                .extra_headers = fwd_headers.items,
-                .keep_alive = true,
-            });
-            defer upstream_req.deinit();
+            var attempt: u8 = 0;
+            while (true) : (attempt += 1) {
+                if (attempt > 0) {
+                    // Drop anything we partially populated on the failed
+                    // attempt so the retry starts from clean state.
+                    for (resp_headers.items) |h| {
+                        self.gpa.free(h.name);
+                        self.gpa.free(h.value);
+                    }
+                    resp_headers.clearRetainingCapacity();
+                    resp_body.writer.end = 0;
+                }
 
-            if (method.requestHasBody()) {
-                upstream_req.transfer_encoding = .{ .content_length = req_body_bytes.len };
-                var body_writer = try upstream_req.sendBodyUnflushed(&.{});
-                try body_writer.writer.writeAll(req_body_bytes);
-                try body_writer.end();
-                try upstream_req.connection.?.flush();
-            } else {
-                try upstream_req.sendBodiless();
-            }
-
-            var redirect_buf: [4096]u8 = undefined;
-            var response = try upstream_req.receiveHead(&redirect_buf);
-
-            resp_status = response.head.status;
-
-            var rit = response.head.iterateHeaders();
-            while (rit.next()) |h| {
-                if (isHopByHop(h.name)) continue;
-                try resp_headers.append(self.gpa, .{
-                    .name = try self.gpa.dupe(u8, h.name),
-                    .value = try self.gpa.dupe(u8, h.value),
-                });
-            }
-
-            if (method.responseHasBody()) {
-                var xfer_buf: [16 * 1024]u8 = undefined;
-                const body_reader = response.reader(&xfer_buf);
-                _ = body_reader.streamRemaining(&resp_body.writer) catch |err| switch (err) {
-                    error.ReadFailed => return response.bodyErr().?,
-                    error.WriteFailed => return err,
+                self.sendUpstreamOnce(
+                    method,
+                    uri,
+                    fwd_headers.items,
+                    req_body_bytes,
+                    &resp_status,
+                    &resp_headers,
+                    &resp_body,
+                ) catch |err| {
+                    if (attempt < 1 and isUpstreamTransportError(err)) {
+                        logPoolReset(err);
+                        self.upstream_client.deinit();
+                        self.upstream_client = .{ .allocator = self.gpa };
+                        continue;
+                    }
+                    return err;
                 };
+                break;
             }
         }
         const resp_body_bytes = resp_body.written();
@@ -534,6 +538,61 @@ pub const Proxy = struct {
                 .resp_headers = resp_headers.items,
                 .resp_body = resp_body_bytes,
             }) catch {};
+        }
+    }
+
+    /// One attempt at the upstream round-trip: open request, write body,
+    /// read response headers + body. Output parameters are populated on
+    /// success; on error, whatever partial state got written is the
+    /// caller's problem to reset. Extracted so the retry loop in
+    /// `forwardRequest` can invoke it twice.
+    fn sendUpstreamOnce(
+        self: *Proxy,
+        method: http.Method,
+        uri: std.Uri,
+        extra_headers: []const http.Header,
+        req_body_bytes: []const u8,
+        out_status: *http.Status,
+        out_headers: *std.ArrayList(http.Header),
+        out_body: *Io.Writer.Allocating,
+    ) !void {
+        var upstream_req = try self.upstream_client.request(method, uri, .{
+            .extra_headers = extra_headers,
+            .keep_alive = true,
+        });
+        defer upstream_req.deinit();
+
+        if (method.requestHasBody()) {
+            upstream_req.transfer_encoding = .{ .content_length = req_body_bytes.len };
+            var body_writer = try upstream_req.sendBodyUnflushed(&.{});
+            try body_writer.writer.writeAll(req_body_bytes);
+            try body_writer.end();
+            try upstream_req.connection.?.flush();
+        } else {
+            try upstream_req.sendBodiless();
+        }
+
+        var redirect_buf: [4096]u8 = undefined;
+        var response = try upstream_req.receiveHead(&redirect_buf);
+
+        out_status.* = response.head.status;
+
+        var rit = response.head.iterateHeaders();
+        while (rit.next()) |h| {
+            if (isHopByHop(h.name)) continue;
+            try out_headers.append(self.gpa, .{
+                .name = try self.gpa.dupe(u8, h.name),
+                .value = try self.gpa.dupe(u8, h.value),
+            });
+        }
+
+        if (method.responseHasBody()) {
+            var xfer_buf: [16 * 1024]u8 = undefined;
+            const body_reader = response.reader(&xfer_buf);
+            _ = body_reader.streamRemaining(&out_body.writer) catch |err| switch (err) {
+                error.ReadFailed => return response.bodyErr().?,
+                error.WriteFailed => return err,
+            };
         }
     }
 
@@ -736,6 +795,41 @@ fn isHopByHop(name: []const u8) bool {
 fn pathOnly(target: []const u8) []const u8 {
     const end = std.mem.indexOfAnyPos(u8, target, 0, "?#") orelse target.len;
     return target[0..end];
+}
+
+/// Returns true for errors that suggest a stale pooled TCP connection —
+/// i.e. the kind where dropping the whole upstream pool and re-dialing
+/// is the right recovery. Real 4xx/5xx responses from Bee are not
+/// errors here: they come back as http.Status values on successful
+/// round-trips, so they don't enter this path at all.
+fn isUpstreamTransportError(err: anyerror) bool {
+    return switch (err) {
+        error.BrokenPipe,
+        error.ConnectionResetByPeer,
+        error.ConnectionRefused,
+        error.ConnectionTimedOut,
+        error.NetworkUnreachable,
+        error.EndOfStream,
+        error.ReadFailed,
+        error.WriteFailed,
+        error.UnexpectedReadFailure,
+        error.UnexpectedWriteFailure,
+        error.HttpConnectionClosing,
+        error.HttpHeadersOversize,
+        error.HttpRequestTruncated,
+        => true,
+        else => false,
+    };
+}
+
+fn logPoolReset(err: anyerror) void {
+    var buf: [256]u8 = undefined;
+    var w = std.fs.File.stderr().writerStreaming(&buf);
+    w.interface.print(
+        "upstream pool reset after {s}; retrying with fresh dial\n",
+        .{@errorName(err)},
+    ) catch return;
+    w.interface.flush() catch return;
 }
 
 /// Encryption + Access Control Trie markers surfaced by Bee on both

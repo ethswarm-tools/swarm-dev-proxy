@@ -172,6 +172,25 @@ hackathon window.
     20 requests through the proxy produce exactly **one** upstream
     TCP connection.
 
+21. **Upstream retry-with-pool-reset on transport errors.** ✅ shipped.
+    Under a sustained workload (fullcircle-research's 47k-chunk
+    manifest save), the remote Bee occasionally closes a pooled
+    connection — keep-alive timeout, server-side GC, packet loss. The
+    stale pooled connection then fails the next request instantly
+    with `BrokenPipe` / `ConnectionResetByPeer` / `EndOfStream` /
+    `HttpConnectionClosing` — and without recovery logic, one bad
+    socket wedges the whole proxy: every subsequent request gets the
+    same dead connection and 502s in ~1.6 ms without ever dialing.
+    Fix: on any transport-class error, drop the entire upstream pool
+    (`deinit` + reinit the shared `http.Client`), then retry the
+    request once with a fresh dial. Real 4xx/5xx responses from Bee
+    pass through unchanged — only connection-level errors trigger
+    the reset. Logged as `upstream pool reset after <error>; retrying
+    with fresh dial` so you can tell from stderr that recovery fired.
+    Verified live: 20 requests at steady ~46 ms, 65-second idle, next
+    request triggers `HttpConnectionClosing` → pool reset → clean 200
+    at 113 ms, subsequent requests back to ~46 ms.
+
 20. **CLI accepts `http://HOST:PORT` for `--upstream`.** Previously
     `parseHostPort` split on the last `:` and treated `http://65…:3000`
     as host `"http://65…"`, port `3000`. Every upstream call then

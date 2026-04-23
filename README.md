@@ -110,6 +110,10 @@ P0 shipped. Working today:
 - Upstream connection pool — one long-lived `std.http.Client` keeps TCP
   connections to Bee alive across all forwarded requests. Measured
   live: 20 proxy→Bee requests produce exactly one TCP connection.
+- Pool recovery — stale pooled connections (Bee closed idle conn,
+  network hiccup) no longer wedge the proxy. On any transport-class
+  error the whole pool is reset and the request retries once with a
+  fresh dial; real 4xx/5xx from Bee pass through untouched.
 
 Example output:
 ```
