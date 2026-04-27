@@ -172,6 +172,23 @@ hackathon window.
     20 requests through the proxy produce exactly **one** upstream
     TCP connection.
 
+26. **Persistent disk cache.** ✅ shipped. `--cache-dir DIR` makes
+    the GET cache and POST-dedup cache survive proxy restarts. New
+    `disk_persist.Persist` module: append-only `.cache` file per
+    store, self-describing records (magic + status + ct/key/body
+    lengths + aux u64 + payload bytes). On startup the file is
+    scanned and every record becomes a live cache entry. Truncate
+    on overflow keeps the file bounded by the same 100k cap as
+    in-memory. Tail-corruption-safe: a half-written record at end
+    is detected and skipped, earlier entries survive. POST-dedup's
+    `req_body_len` round-trips through the aux field so
+    `bytes_saved` stats survive too. Dev iterate-loop:
+    second `era:upload` with the same content finds everything in
+    the on-disk cache, hits 100% dedup, no upstream traffic.
+    Verified live: 5 unique POSTs in run 1 produced 680 B
+    download.cache + 1230 B post_dedup.cache; run 2 with the same
+    dir got 5/5 dedup hits and 100 B saved.
+
 22. **Threaded accept loop.** ✅ shipped. `run()` now spawns a
     detached `std.Thread` per accepted connection, so concurrent
     clients (bee-js's manifestUploader fires 32-concurrent) no

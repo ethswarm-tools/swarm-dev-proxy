@@ -16,6 +16,7 @@ pub const ui = @import("ui.zig");
 pub const replay = @import("replay.zig");
 pub const manifest = @import("manifest.zig");
 pub const post_dedup = @import("post_dedup.zig");
+pub const disk_persist = @import("disk_persist.zig");
 
 pub const Config = struct {
     listen_addr: []const u8 = "127.0.0.1",
@@ -44,6 +45,12 @@ pub const Config = struct {
     /// content-length is not capped (the check is a header
     /// heuristic, not a streaming cap).
     max_request_body_bytes: ?u64 = null,
+    /// Directory for persistent caches. `null` = in-memory only.
+    /// When set, the GET cache and POST-dedup cache survive proxy
+    /// restarts: every successful entry is appended to a `.cache`
+    /// file in this directory, and on startup the files are
+    /// replayed back into memory. Created if missing.
+    cache_dir: ?[]const u8 = null,
 };
 
 pub const Proxy = struct {
@@ -76,6 +83,10 @@ pub const Proxy = struct {
     /// during concurrent dispatch are consistent.
     enc_count: std.atomic.Value(u64) = .init(0),
     act_count: std.atomic.Value(u64) = .init(0),
+    /// On-disk persistence handles, allocated only when
+    /// `cfg.cache_dir != null`. Owned by Proxy.
+    download_persist: ?disk_persist.Persist = null,
+    post_dedup_persist: ?disk_persist.Persist = null,
 
     pub fn init(gpa: std.mem.Allocator, cfg: Config) Proxy {
         return .{
@@ -100,6 +111,29 @@ pub const Proxy = struct {
         self.clearInspectionCaches();
         self.chunk_inspection_cache.deinit(self.gpa);
         self.manifest_inspection_cache.deinit(self.gpa);
+        if (self.download_persist) |*p| p.close();
+        if (self.post_dedup_persist) |*p| p.close();
+    }
+
+    /// Open `cache_dir`'s persistence files (if configured) and
+    /// replay their entries into the in-memory caches. Call after
+    /// `init` and before `run`. Splitting this out of `init` keeps
+    /// the constructor non-fallible and lets callers control
+    /// whether persistence is enabled at runtime.
+    pub fn openPersistence(self: *Proxy) !void {
+        const dir = self.cfg.cache_dir orelse return;
+
+        var dl_buf: [1024]u8 = undefined;
+        const dl_path = try std.fmt.bufPrint(&dl_buf, "{s}/download.cache", .{dir});
+        self.download_persist = try disk_persist.Persist.open(dl_path);
+        self.download_cache.persist = &self.download_persist.?;
+        try self.download_cache.loadFromDisk();
+
+        var dd_buf: [1024]u8 = undefined;
+        const dd_path = try std.fmt.bufPrint(&dd_buf, "{s}/post_dedup.cache", .{dir});
+        self.post_dedup_persist = try disk_persist.Persist.open(dd_path);
+        self.post_dedup_cache.persist = &self.post_dedup_persist.?;
+        try self.post_dedup_cache.loadFromDisk();
     }
 
     const INSPECTION_CACHE_MAX: usize = 100_000;
@@ -2820,5 +2854,60 @@ test "/bzz/ GET with Range header bypasses cache" {
     try std.testing.expectEqual(@as(u64, 0), s.hits);
     try std.testing.expectEqual(@as(u64, 0), s.misses);
     try std.testing.expectEqual(@as(usize, 0), s.entries);
+}
+
+test "disk-persisted cache survives proxy restart" {
+    const gpa = std.testing.allocator;
+
+    // Unique temp directory for this test run.
+    var dir_buf: [128]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, "/tmp/swarm-dev-proxy-cachedir-{x}", .{std.time.nanoTimestamp()});
+    defer {
+        // Clean up the directory and its files.
+        std.fs.cwd().deleteTree(dir) catch {};
+    }
+
+    // First proxy lifetime: store a couple of cache + dedup entries.
+    {
+        var p = Proxy.init(gpa, .{ .mock_enabled = true, .cache_dir = dir });
+        defer p.deinit();
+        try p.openPersistence();
+
+        try p.download_cache.put("/bytes/abc", 200, "application/octet-stream", "the body");
+        _ = try p.post_dedup_cache.put(
+            "deadbeef",
+            "batchA",
+            .{ .status = 201, .content_type = "application/json", .body = "{\"reference\":\"x\"}" },
+            12,
+        );
+    }
+
+    // Second proxy lifetime: same cache_dir → entries should reload.
+    {
+        var p = Proxy.init(gpa, .{ .mock_enabled = true, .cache_dir = dir });
+        defer p.deinit();
+        try p.openPersistence();
+
+        const dl_hit = p.download_cache.get("/bytes/abc").?;
+        try std.testing.expectEqual(@as(u16, 200), dl_hit.status);
+        try std.testing.expectEqualStrings("application/octet-stream", dl_hit.content_type.?);
+        try std.testing.expectEqualStrings("the body", dl_hit.body);
+
+        const dd_hit = p.post_dedup_cache.get("deadbeef", "batchA").?;
+        try std.testing.expectEqual(@as(u16, 201), dd_hit.status);
+        try std.testing.expectEqualStrings("{\"reference\":\"x\"}", dd_hit.body);
+
+        // Stats: download_cache should reflect the loaded entry's bytes.
+        const dl_stats = p.download_cache.stats();
+        try std.testing.expectEqual(@as(usize, 1), dl_stats.entries);
+        try std.testing.expectEqual(@as(u64, "the body".len), dl_stats.bytes);
+
+        // post_dedup should preserve req_body_len through the aux field.
+        // After one hit, bytes_saved should be 12 (the originally-stored
+        // req_body_len, replayed from disk).
+        const dd_stats = p.post_dedup_cache.stats();
+        try std.testing.expectEqual(@as(usize, 1), dd_stats.entries);
+        try std.testing.expectEqual(@as(u64, 12), dd_stats.bytes_saved);
+    }
 }
 

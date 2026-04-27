@@ -26,6 +26,7 @@
 //!   - Only effective within one proxy process lifetime.
 
 const std = @import("std");
+const disk_persist = @import("disk_persist.zig");
 
 pub const Entry = struct {
     status: u16,
@@ -56,6 +57,8 @@ pub const Cache = struct {
     /// Cumulative request-body bytes the proxy avoided sending upstream
     /// because of dedup hits.
     bytes_saved: u64 = 0,
+    /// Optional on-disk persistence; same shape as `cache.Cache`.
+    persist: ?*disk_persist.Persist = null,
 
     const Stored = struct {
         status: u16,
@@ -136,6 +139,7 @@ pub const Cache = struct {
         if (c.entries.count() >= c.max_entries) {
             c.clearLocked();
             c.evictions += 1;
+            if (c.persist) |p| p.truncate() catch {};
         }
         const body_owned = try c.gpa.dupe(u8, entry.body);
         errdefer c.gpa.free(body_owned);
@@ -147,6 +151,37 @@ pub const Cache = struct {
             .body = body_owned,
             .req_body_len = req_body_len,
         });
+
+        if (c.persist) |p| {
+            p.append(key, entry.status, entry.content_type, entry.body, req_body_len) catch {};
+        }
+    }
+
+    /// Restore previously-persisted entries from disk.
+    pub fn loadFromDisk(c: *Cache) !void {
+        const persist = c.persist orelse return;
+        var it = try persist.iter(c.gpa);
+        while (try it.next()) |rec| {
+            errdefer {
+                c.gpa.free(rec.key);
+                if (rec.content_type) |x| c.gpa.free(x);
+                c.gpa.free(rec.body);
+            }
+            const gop = try c.entries.getOrPut(c.gpa, rec.key);
+            if (gop.found_existing) {
+                c.gpa.free(rec.key);
+                if (rec.content_type) |x| c.gpa.free(x);
+                c.gpa.free(rec.body);
+                continue;
+            }
+            gop.key_ptr.* = rec.key;
+            gop.value_ptr.* = .{
+                .status = rec.status,
+                .content_type = rec.content_type,
+                .body = rec.body,
+                .req_body_len = rec.aux,
+            };
+        }
     }
 
     /// Caller must hold c.mu. Frees all live entries; counters persist.

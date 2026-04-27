@@ -13,6 +13,7 @@ const usage =
     \\  --no-chunks            skip root-chunk side-fetch on POST /bytes and /bzz
     \\  --no-post-dedup        disable content-hash dedup of POST /bytes and /chunks
     \\  --max-body-mb N        reject requests whose content-length exceeds N MiB (413)
+    \\  --cache-dir DIR        persist GET cache + POST-dedup cache to DIR across restarts
     \\  --mock                 serve from in-process mock (no upstream required)
     \\  --replay-log FILE      append every request/response to FILE as ndjson
     \\  --help, -h             show this message
@@ -56,6 +57,10 @@ pub fn main() !void {
             const mb = std.fmt.parseInt(u64, args[i], 10) catch
                 return die("invalid --max-body-mb value");
             cfg.max_request_body_bytes = mb * 1024 * 1024;
+        } else if (std.mem.eql(u8, a, "--cache-dir")) {
+            i += 1;
+            if (i >= args.len) return die("--cache-dir requires DIR");
+            cfg.cache_dir = args[i];
         } else if (std.mem.eql(u8, a, "--mock")) {
             cfg.mock_enabled = true;
         } else if (std.mem.eql(u8, a, "--replay-log")) {
@@ -70,6 +75,8 @@ pub fn main() !void {
 
     var p = proxy_lib.Proxy.init(gpa, cfg);
     defer p.deinit();
+
+    try p.openPersistence();
 
     var replay_writer_storage: proxy_lib.replay.Writer = undefined;
     if (replay_log_path) |path| {

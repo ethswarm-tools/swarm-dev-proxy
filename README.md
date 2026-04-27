@@ -121,6 +121,10 @@ P0 shipped. Working today:
   win.
 - Bounded caches — both GET-cache and POST-dedup enforce a 100 000
   entry cap with clear-on-overflow. Eviction counter exposed in stats.
+- `--cache-dir DIR` — disk-persisted GET cache + POST-dedup cache.
+  Append-only `.cache` files with self-describing records. Survive
+  restarts; second `era:upload` with the same content runs at 100%
+  dedup against memory + disk. Tail-corruption-safe.
 
 Example output:
 ```

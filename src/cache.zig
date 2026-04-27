@@ -7,6 +7,7 @@
 //! evicted, which for now is never).
 
 const std = @import("std");
+const disk_persist = @import("disk_persist.zig");
 
 pub const Entry = struct {
     status: u16,
@@ -30,12 +31,51 @@ pub const Cache = struct {
     misses: u64 = 0,
     evictions: u64 = 0,
     max_entries: usize = MAX_ENTRIES_DEFAULT,
+    /// Optional on-disk persistence; if set, every successful `put`
+    /// also appends a record and overflow truncates the file. The
+    /// pointer's owned by the Proxy; we never deinit it here.
+    persist: ?*disk_persist.Persist = null,
 
     const Stored = struct {
         status: u16,
         content_type: ?[]const u8, // owned or null
         body: []const u8, // owned
     };
+
+    /// Restore previously-persisted entries from disk. Call once
+    /// after init() and before serving requests. Each successful
+    /// record becomes a live entry. Called outside the mutex
+    /// because no other thread is touching the cache yet.
+    pub fn loadFromDisk(c: *Cache) !void {
+        const persist = c.persist orelse return;
+        var it = try persist.iter(c.gpa);
+        while (try it.next()) |rec| {
+            // Ownership move: rec.* slices are owned by us; insert
+            // them directly into the hashmap.
+            errdefer {
+                c.gpa.free(rec.key);
+                if (rec.content_type) |x| c.gpa.free(x);
+                c.gpa.free(rec.body);
+            }
+            const gop = try c.entries.getOrPut(c.gpa, rec.key);
+            if (gop.found_existing) {
+                // Two records for the same key (shouldn't happen for
+                // immutable content addressing, but be defensive on
+                // an old/replayed file). Free the new one.
+                c.gpa.free(rec.key);
+                if (rec.content_type) |x| c.gpa.free(x);
+                c.gpa.free(rec.body);
+                continue;
+            }
+            gop.key_ptr.* = rec.key;
+            gop.value_ptr.* = .{
+                .status = rec.status,
+                .content_type = rec.content_type,
+                .body = rec.body,
+            };
+            c.total_bytes += rec.body.len;
+        }
+    }
 
     pub fn deinit(c: *Cache) void {
         c.mu.lock();
@@ -83,6 +123,7 @@ pub const Cache = struct {
         if (c.entries.count() >= c.max_entries) {
             c.clearLocked();
             c.evictions += 1;
+            if (c.persist) |p| p.truncate() catch {};
         }
 
         const key_owned = try c.gpa.dupe(u8, key);
@@ -98,6 +139,13 @@ pub const Cache = struct {
             .body = body_owned,
         });
         c.total_bytes += body.len;
+
+        // Best-effort disk persistence. If the disk is full or the
+        // append fails for any reason, we keep the in-memory entry —
+        // a transient disk error shouldn't lose the live cache.
+        if (c.persist) |p| {
+            p.append(key, status, content_type, body, 0) catch {};
+        }
     }
 
     /// Caller must hold c.mu. Free every stored entry + key and reset

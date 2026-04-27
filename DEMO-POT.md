@@ -363,6 +363,67 @@ first fetch.
 
 ---
 
+## 2d. Persistent disk cache — survive proxy restarts
+
+The biggest dev-iterate-loop speedup: pass `--cache-dir DIR` and the
+GET cache + POST-dedup cache survive across proxy restarts. The
+second time you run the same workload, every chunk is found in the
+on-disk cache and never touches the backend.
+
+```bash
+CACHE=/tmp/sdp-cache
+
+# Run 1: populate
+./zig-out/bin/swarm_dev_proxy --mock --cache-dir $CACHE &
+PID=$!
+sleep 0.3
+BATCH=abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
+for i in 1 2 3 4 5; do
+  curl -s -X POST -H "swarm-postage-batch-id: $BATCH" \
+    -d "persistent-content-$i" http://127.0.0.1:1733/bytes > /dev/null
+done
+kill $PID; wait
+ls -la $CACHE
+# -rw-rw-r-- ... download.cache
+# -rw-rw-r-- ... post_dedup.cache
+
+# Run 2: restart, same dir, same content
+./zig-out/bin/swarm_dev_proxy --mock --cache-dir $CACHE &
+PID=$!
+sleep 0.3
+for i in 1 2 3 4 5; do
+  curl -s -X POST -H "swarm-postage-batch-id: $BATCH" \
+    -d "persistent-content-$i" http://127.0.0.1:1733/bytes > /dev/null
+done
+# All 5 should show post_dedup=hit, even though this is a fresh process.
+```
+
+Proxy log on run 2:
+
+```
+POST /bytes -> 201 (2ms req=20B …) stamp=abcdef01 #1 up=20B total_up=20B util=0.0% ttl=7d0h0m post_dedup=hit wt=cached root=9734a7dc
+POST /bytes -> 201 (1ms req=20B …) stamp=abcdef01 #2 up=20B total_up=40B … post_dedup=hit wt=cached root=d071556e
+… (5/5 hits)
+```
+
+Dashboard at `/_proxy` shows `5 entries / 5 hits / 0 misses / 100 B saved`.
+
+What's stored on disk:
+- `<cache-dir>/download.cache` — the GET-cache entries
+- `<cache-dir>/post_dedup.cache` — the POST-dedup entries
+
+Both are append-only with self-describing records. A mid-write crash
+truncates the tail; earlier entries are intact on next startup. The
+100k-entry cap from memory still applies — on overflow, the file is
+truncated and rebuilds from scratch.
+
+For your `era:upload` workflow this means: the *second* run of
+`pnpm era:upload --bee-url http://127.0.0.1:1733 0` against the same
+batch ID finds everything pre-deduped on disk. Zero upstream traffic
+for the repeat upload phase.
+
+---
+
 ## 2c. Upstream connection pool — measure it yourself
 
 The proxy keeps a single long-lived TCP connection to Bee and reuses
